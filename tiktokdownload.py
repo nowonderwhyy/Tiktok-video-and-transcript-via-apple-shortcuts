@@ -65,20 +65,51 @@ def worker():
                 outtmpl = str(VIDEO_DIR / f"{job_id}.%(ext)s")
                 ydl_opts = {
                     "outtmpl": outtmpl,
-                    "format": "mp4/best",
+                    # Best video + best audio, fallback to best single file
+                    "format": "bv*+ba/best",
+
+                    # Prefer ffmpeg for HLS (avoids flaky hlsnative)
+                    "hls_prefer_native": False,
+
+                    # Reliability
+                    "skip_unavailable_fragments": True,
+                    "fragment_retries": 20,
+                    "retries": 10,
+                    "concurrent_fragment_downloads": 8,
+                    "noplaylist": True,
+
+                    # Keep the merged MP4 even after extracting audio
+                    "keepvideo": True,
+
+                    # Postprocess/merge to MP4 (requires ffmpeg in PATH)
+                    "postprocessors": [
+                        {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+                        {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"},
+                    ],
                     "merge_output_format": "mp4",
+
+                    # Help YouTube extraction
+                    "http_headers": {"User-Agent": "Mozilla/5.0"},
+                    "extractor_args": {"youtube": {"player_client": ["web", "ios", "android"]}},
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
                 # Update global video_path to the saved mp4
                 saved_mp4 = str(VIDEO_DIR / f"{job_id}.mp4")
+                saved_audio_m4a = str(VIDEO_DIR / f"{job_id}.m4a")
                 global video_path
-                video_path = saved_mp4
+                if os.path.exists(saved_mp4):
+                    video_path = saved_mp4
+                else:
+                    video_path = None
 
-                # Transcribe downloaded video
-                result = model.transcribe(saved_mp4)
+                # Transcribe downloaded media (prefer extracted m4a for speed)
+                source_for_transcription = saved_audio_m4a if os.path.exists(saved_audio_m4a) else saved_mp4
+                result = model.transcribe(source_for_transcription)
                 transcription = result["text"]
+                if not transcription or not transcription.strip():
+                    transcription = "..."
 
                 # Save transcription to a file in the same folder as this script
                 output_path = os.path.join(script_dir, "transcription.txt")
@@ -95,6 +126,9 @@ def worker():
 
             except Exception as e:
                 print(f"[-] Error occurred: {e}")
+                with lock:
+                    if not data.get("transcription"):
+                        data["transcription"] = "..."
 
         time.sleep(5)
 
