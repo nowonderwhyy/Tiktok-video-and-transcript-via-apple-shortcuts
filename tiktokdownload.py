@@ -7,6 +7,9 @@ import os
 import time
 from pathlib import Path
 import uuid
+import tkinter as tk
+from tkinter import ttk, messagebox
+import webbrowser
 
 # Server configuration
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -132,11 +135,108 @@ def worker():
 
         time.sleep(5)
 
+def start_flask():
+    # Run Flask server in a background thread without the reloader
+    app.run(host='0.0.0.0', port=5000, use_reloader=False)
+
+def start_gui():
+    # Simple Tkinter UI to submit a URL and watch transcription status
+    root = tk.Tk()
+    root.title("TikTok Downloader & Transcriber")
+
+    url_var = tk.StringVar()
+    status_var = tk.StringVar(value="Idle")
+    last_text = {"value": ""}
+    last_video_url = {"value": ""}
+
+    container = ttk.Frame(root, padding=12)
+    container.pack(fill=tk.BOTH, expand=True)
+
+    ttk.Label(container, text="Paste video URL:").pack(anchor=tk.W)
+    entry = ttk.Entry(container, textvariable=url_var, width=70)
+    entry.pack(fill=tk.X)
+    entry.focus_set()
+
+    def submit_url():
+        url = url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please paste a video URL.")
+            return
+        try:
+            requests.post('http://127.0.0.1:5000/set_url', json={"url": url}, timeout=5)
+        except Exception:
+            # Fallback: set in-memory if local server not yet reachable
+            global video_path
+            with lock:
+                data["url"] = url
+                data["transcription"] = ""
+                video_path = None
+        status_var.set("Submitted. Processing...")
+
+    ttk.Button(container, text="Submit", command=submit_url).pack(anchor=tk.W, pady=(6, 10))
+
+    ttk.Label(container, textvariable=status_var).pack(anchor=tk.W)
+    ttk.Label(container, text="Transcription:").pack(anchor=tk.W, pady=(10, 2))
+
+    transcript = tk.Text(container, height=10, wrap=tk.WORD)
+    transcript.pack(fill=tk.BOTH, expand=True)
+    transcript.configure(state=tk.DISABLED)
+
+    def set_transcript_text(text):
+        transcript.configure(state=tk.NORMAL)
+        transcript.delete("1.0", tk.END)
+        transcript.insert(tk.END, text)
+        transcript.configure(state=tk.DISABLED)
+
+    link_frame = ttk.Frame(container)
+    link_frame.pack(fill=tk.X, pady=(8, 0))
+    video_btn = ttk.Button(link_frame, text="Open Downloaded Video", state=tk.DISABLED)
+    video_btn.pack(anchor=tk.W)
+
+    def open_video():
+        if last_video_url["value"]:
+            try:
+                webbrowser.open(last_video_url["value"])  # open in default browser
+            except Exception:
+                pass
+
+    video_btn.configure(command=open_video)
+
+    def poll():
+        try:
+            resp = requests.get('http://127.0.0.1:5000/get_transcription', timeout=5)
+            if resp.ok:
+                payload = resp.json()
+                text = payload.get("transcription", "") or "..."
+                video_url = payload.get("video_url", "")
+                if text != last_text["value"]:
+                    last_text["value"] = text
+                    set_transcript_text(text)
+                    # Update status based on whether we're still waiting
+                    if text.strip() and text.strip() != "...":
+                        status_var.set("Completed")
+                    else:
+                        status_var.set("Processing...")
+                if video_url != last_video_url["value"]:
+                    last_video_url["value"] = video_url
+                    video_btn.configure(state=(tk.NORMAL if video_url else tk.DISABLED))
+        except Exception:
+            # Server might not be up yet
+            pass
+        finally:
+            root.after(3000, poll)
+
+    root.after(1000, poll)
+    root.mainloop()
+
 if __name__ == '__main__':
-    # Start worker thread
+    # Start background worker
     thread = Thread(target=worker, daemon=True)
     thread.start()
 
-    # IMPORTANT: Use host='0.0.0.0' so other devices on LAN can connect.
-    # Then, from your iPhone, access: http://YOURHOSTNAME.local:5000
-    app.run(host='0.0.0.0', port=5000)
+    # Run Flask server in background so GUI can run in the main thread
+    server_thread = Thread(target=start_flask, daemon=True)
+    server_thread.start()
+
+    # Start the desktop GUI for local input
+    start_gui()
