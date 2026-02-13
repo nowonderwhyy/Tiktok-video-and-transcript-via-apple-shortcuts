@@ -3,7 +3,6 @@ from threading import Thread, Lock
 import requests
 import yt_dlp
 from yt_dlp.postprocessor import FFmpegPostProcessor
-import whisper
 import os
 import subprocess
 import sys
@@ -13,8 +12,6 @@ import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 import uuid
-import tkinter as tk
-from tkinter import ttk, messagebox
 import webbrowser
 
 # Server configuration
@@ -224,19 +221,8 @@ def get_transcription():
 
 def worker():
     last_processed_key = ""
-    ffmpeg_bin = find_ffmpeg_bin()
-    if ffmpeg_bin:
-        FFmpegPostProcessor._ffmpeg_location.set(ffmpeg_bin)
-        print(f"[+] Using ffmpeg from: {ffmpeg_bin}")
-    else:
-        print("[!] ffmpeg not found. Install it for full support (Instagram, postprocessing).")
-        print("    Windows: winget install ffmpeg")
-    print(f"[+] Videos save to: {VIDEO_DIR}")
-    if TRANSCRIBE_ENABLED:
-        print(f"[+] Audio saves to: {AUDIO_DIR}")
-        model = whisper.load_model("base", device="cpu")
-    else:
-        model = None
+    model = None  # Lazy-loaded when first URL needs transcription
+    ffmpeg_bin = None  # Lazy-loaded on first URL (speeds up startup)
 
     while True:
         with lock:
@@ -244,6 +230,18 @@ def worker():
 
         url_key = normalize_url_for_dedup(url)
         if url and is_valid_video_url(url) and url_key and url_key != last_processed_key:
+            # Lazy-init ffmpeg on first URL (speeds up startup)
+            if ffmpeg_bin is None:
+                ffmpeg_bin = find_ffmpeg_bin()
+                if ffmpeg_bin:
+                    FFmpegPostProcessor._ffmpeg_location.set(ffmpeg_bin)
+                    print(f"[+] Using ffmpeg from: {ffmpeg_bin}")
+                else:
+                    print("[!] ffmpeg not found. Install it for full support (Instagram, postprocessing).")
+                print(f"[+] Videos save to: {VIDEO_DIR}")
+                if TRANSCRIBE_ENABLED:
+                    print(f"[+] Audio saves to: {AUDIO_DIR}")
+
             print(f"[+] Processing new URL: {url}")
 
             try:
@@ -381,7 +379,12 @@ def worker():
                     saved_audio_m4a = dest_m4a
                     print(f"[+] Audio saved: {dest_m4a}")
 
-                if TRANSCRIBE_ENABLED and model:
+                if TRANSCRIBE_ENABLED:
+                    # Lazy-load Whisper on first use (speeds up startup)
+                    if model is None:
+                        print("[+] Loading Whisper model (first transcription)...")
+                        import whisper
+                        model = whisper.load_model("base", device="cpu")
                     # Transcribe downloaded media (prefer extracted m4a for speed)
                     source_for_transcription = saved_audio_m4a if os.path.exists(saved_audio_m4a) else video_path
                     if not source_for_transcription or not os.path.exists(source_for_transcription):
@@ -420,6 +423,8 @@ def start_flask():
     app.run(host='0.0.0.0', port=5000, use_reloader=False)
 
 def start_gui():
+    import tkinter as tk
+    from tkinter import ttk, messagebox
     # Simple Tkinter UI to submit a URL and watch transcription status
     root = tk.Tk()
     root.title("TikTok Downloader & Transcriber")
@@ -514,13 +519,13 @@ if __name__ == '__main__':
     globals()["TRANSCRIBE_ENABLED"] = TRANSCRIBE_ENABLED
     print(f"  Mode: {'Transcribe' if TRANSCRIBE_ENABLED else 'Download only'}\n")
 
-    # Start background worker
-    thread = Thread(target=worker, daemon=True)
-    thread.start()
-
-    # Run Flask server in background so GUI can run in the main thread
+    # Start Flask first so server accepts connections ASAP
     server_thread = Thread(target=start_flask, daemon=True)
     server_thread.start()
+
+    # Start background worker (ffmpeg/whisper load lazily on first URL)
+    worker_thread = Thread(target=worker, daemon=True)
+    worker_thread.start()
 
     # Start the desktop GUI for local input
     start_gui()
