@@ -5,6 +5,7 @@ import yt_dlp
 from yt_dlp.postprocessor import FFmpegPostProcessor
 import whisper
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -141,9 +142,49 @@ def is_valid_video_url(url):
     if host in ("localhost", "127.0.0.1", "pkm.local", "0.0.0.0") or host.endswith(".local"):
         return False
     # Must look like a video platform
-    if any(x in host for x in ("tiktok", "instagram", "youtube", "youtu.be", "vm.tiktok")):
+    if any(x in host for x in ("tiktok", "instagram", "youtube", "youtu.be", "vm.tiktok", "x.com", "twitter")):
         return True
     return True  # Allow other http(s) URLs (e.g. other platforms)
+
+
+def is_x_url(url):
+    """Check if URL is from X (Twitter)."""
+    if not url:
+        return False
+    parsed = urlparse(url.strip().lower())
+    host = (parsed.netloc or "").split(":")[0]
+    return "x.com" in host or "twitter.com" in host
+
+
+def convert_mp4_to_gif(ffmpeg_bin, input_path, output_path):
+    """Convert video (mp4/webm) to gif using ffmpeg with palette for quality."""
+    bin_dir = Path(ffmpeg_bin)
+    ffmpeg_exe = str(bin_dir / "ffmpeg.exe") if os.name == "nt" else str(bin_dir / "ffmpeg")
+    if not os.path.exists(ffmpeg_exe):
+        ffmpeg_exe = shutil.which("ffmpeg") or "ffmpeg"
+    cmd = [
+        ffmpeg_exe, "-y", "-i", input_path,
+        "-filter_complex", "[0:v] split [a][b];[a] palettegen [p];[b][p] paletteuse",
+        "-f", "gif", output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0 and os.path.exists(output_path)
+
+
+def is_likely_x_gif(ydl, url):
+    """Try to detect if X URL is a GIF (short looping video). Returns True if likely GIF."""
+    try:
+        info = ydl.extract_info(url, download=False)
+        if not info:
+            return False
+        # X GIFs: usually short (< 30 sec)
+        duration = info.get("duration")
+        if duration is not None:
+            return duration <= 30  # GIFs are typically 2–15 sec
+        # No duration: could be GIF, be conservative and try conversion for short files
+        return True
+    except Exception:
+        return False
 
 
 @app.route('/set_url', methods=['POST'])
@@ -267,6 +308,16 @@ def worker():
                         "http_headers": {"User-Agent": "Mozilla/5.0"},
                         "extractor_args": {"youtube": {"player_client": ["web", "ios", "android"]}},
                     }
+                # For X URLs, check if it's a GIF before download (to convert to .gif after)
+                convert_to_gif = False
+                if is_x_url(url) and ffmpeg_bin:
+                    try:
+                        probe_opts = {"noplaylist": True, "quiet": True}
+                        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                            convert_to_gif = is_likely_x_gif(ydl, url)
+                    except Exception:
+                        pass
+
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
@@ -282,6 +333,20 @@ def worker():
                     video_path = str(candidates[0]) if candidates else None
                 if video_path:
                     print(f"[+] Video saved: {video_path}")
+
+                # Convert X GIFs from mp4 to actual .gif
+                if convert_to_gif and video_path and ffmpeg_bin:
+                    gif_path = str(VIDEO_DIR / f"{job_id}.gif")
+                    original_video = video_path
+                    if convert_mp4_to_gif(ffmpeg_bin, video_path, gif_path):
+                        video_path = gif_path
+                        try:
+                            os.remove(original_video)
+                            print(f"[+] Converted to GIF, removed original: {original_video}")
+                        except OSError as e:
+                            print(f"[+] Converted to GIF: {video_path} (could not remove original: {e})")
+                    else:
+                        print(f"[-] GIF conversion failed, keeping mp4")
 
                 # Move audio to AUDIO_DIR when transcribing (videos stay in VIDEO_DIR)
                 if TRANSCRIBE_ENABLED and os.path.exists(saved_audio_m4a):
@@ -313,7 +378,7 @@ def worker():
                     print(f"[+] Transcription saved to: {output_path}")
                 else:
                     with lock:
-                        data["transcription"] = "(transcription disabled)"
+                        data["transcription"] = url
 
                 last_processed_key = url_key
 
