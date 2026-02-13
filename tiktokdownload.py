@@ -2,10 +2,15 @@ from flask import Flask, request, jsonify, send_from_directory
 from threading import Thread, Lock
 import requests
 import yt_dlp
+from yt_dlp.postprocessor import FFmpegPostProcessor
 import whisper
 import os
+import sys
 import time
+import traceback
+import shutil
 from pathlib import Path
+from urllib.parse import urlparse
 import uuid
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -16,20 +21,145 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 data = {"url": "", "transcription": ""}
 lock = Lock()
 script_dir = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = Path(__file__).parent
-VIDEO_DIR = BASE_DIR / "static" / "videos"
+BASE_DIR = Path(__file__).resolve().parent
+VIDEO_DIR = (BASE_DIR / "static" / "videos").resolve()
+AUDIO_DIR = (BASE_DIR / "static" / "audio").resolve()
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # Path to saved mp4 for current job
 video_path = None
 
+# Set at startup by prompt_transcribe_choice()
+TRANSCRIBE_ENABLED = True
+
+
+def prompt_transcribe_choice():
+    """Console menu: arrow keys + Enter to choose whether to transcribe videos."""
+    options = ["Yes - transcribe videos (videos in videos/, audio in audio/)", "No - download only (video in videos/)"]
+    selected = 0
+
+    def clear_and_render():
+        if sys.platform == "win32":
+            os.system("cls")
+        else:
+            os.system("clear")
+        print("\n  Transcribe videos?\n")
+        for i, opt in enumerate(options):
+            prefix = "  > " if i == selected else "    "
+            print(f"{prefix} {opt}")
+        print("\n  Use ↑/↓ to move, Enter to select\n")
+
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            while True:
+                clear_and_render()
+                ch = msvcrt.getch()
+                if ch == b"\xe0":
+                    ch2 = msvcrt.getch()
+                    if ch2 == b"H":  # Up
+                        selected = (selected - 1) % len(options)
+                    elif ch2 == b"P":  # Down
+                        selected = (selected + 1) % len(options)
+                elif ch in (b"\r", b"\n"):  # Enter
+                    return selected == 0
+        except ImportError:
+            pass
+    # Fallback: simple prompt
+    print("\n  Transcribe videos?")
+    for i, opt in enumerate(options):
+        print(f"  {i + 1}. {opt}")
+    while True:
+        try:
+            choice = input("  Enter 1 or 2: ").strip()
+            if choice in ("1", "2"):
+                print()
+                return choice == "1"
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            return True
+
+
+def normalize_url_for_dedup(url):
+    """Return a canonical key for the same video (ignores tracking params, trailing slash)."""
+    if not url or not url.strip():
+        return ""
+    parsed = urlparse(url.strip())
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/") or "/"
+    # TikTok: tiktok.com/t/XXX and vm.tiktok.com/XXX resolve to same video
+    if "tiktok" in netloc and path and path != "/":
+        code = path.strip("/").split("/")[-1]  # last segment (handles /t/XXX and /XXX)
+        if code:
+            return f"tiktok:{code}"
+    # Instagram: /reel/XXX
+    if "instagram" in netloc and "/reel/" in path:
+        parts = path.split("/reel/")
+        if len(parts) >= 2 and parts[-1]:
+            return f"instagram:reel:{parts[-1].split('/')[0]}"
+    # Fallback: netloc + path
+    return f"{netloc}{path}"
+
+
+def find_ffmpeg_bin():
+    """Return path to directory containing ffmpeg.exe and ffprobe.exe, or None."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    # Prefer real bin over PATH (winget Links can be symlinks; some tools prefer real path)
+    winget_gyan = Path(local) / "Microsoft" / "WinGet" / "Packages" / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+    if winget_gyan.exists():
+        for sub in winget_gyan.iterdir():
+            if sub.is_dir():
+                bin_dir = sub / "bin"
+                if (bin_dir / "ffmpeg.exe").exists() and (bin_dir / "ffprobe.exe").exists():
+                    return str(bin_dir)
+    ff = shutil.which("ffmpeg")
+    fp = shutil.which("ffprobe")
+    if ff and fp:
+        return str(Path(ff).parent)
+    winget_base = Path(local) / "Microsoft" / "WinGet" / "Packages"
+    if winget_base.exists():
+        for sub in winget_base.rglob("ffmpeg.exe"):
+            bin_dir = sub.parent
+            if (bin_dir / "ffprobe.exe").exists():
+                return str(bin_dir)
+    return None
+
+
+def is_valid_video_url(url):
+    """Reject placeholders, self-URLs, and obviously invalid URLs."""
+    if not url or not isinstance(url, str):
+        return False
+    u = url.strip().lower()
+    if not u or u == "..." or u.startswith("ytsearch:"):
+        return False
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    # Reject URLs pointing to this app (shortcut may send server URL by mistake)
+    parsed = urlparse(u)
+    host = (parsed.netloc or "").split(":")[0]
+    if host in ("localhost", "127.0.0.1", "pkm.local", "0.0.0.0") or host.endswith(".local"):
+        return False
+    # Must look like a video platform
+    if any(x in host for x in ("tiktok", "instagram", "youtube", "youtu.be", "vm.tiktok")):
+        return True
+    return True  # Allow other http(s) URLs (e.g. other platforms)
+
+
 @app.route('/set_url', methods=['POST'])
 def set_url():
-    content = request.json
+    content = request.json or {}
+    new_url = content.get('url', '').strip()
+    if not is_valid_video_url(new_url):
+        print(f"[!] Rejected invalid URL: {repr(new_url)[:50]}")
+        return jsonify({"status": "Invalid URL", "error": "Provide a valid TikTok, Instagram, or YouTube URL"}), 400
+    new_key = normalize_url_for_dedup(new_url)
     with lock:
-        data["url"] = content.get('url', '')
+        current_key = normalize_url_for_dedup(data.get("url", ""))
+        if new_key and new_key == current_key:
+            return jsonify({"status": "URL already set"})
+        data["url"] = new_url
         data["transcription"] = ""
-        # reset video path for new job
         global video_path
         video_path = None
         print(f"[+] URL received: {data['url']}")
@@ -52,83 +182,145 @@ def get_transcription():
         })
 
 def worker():
-    last_processed_url = ""
-    model = whisper.load_model("base")
+    last_processed_key = ""
+    ffmpeg_bin = find_ffmpeg_bin()
+    if ffmpeg_bin:
+        FFmpegPostProcessor._ffmpeg_location.set(ffmpeg_bin)
+        print(f"[+] Using ffmpeg from: {ffmpeg_bin}")
+    else:
+        print("[!] ffmpeg not found. Install it for full support (Instagram, postprocessing).")
+        print("    Windows: winget install ffmpeg")
+    print(f"[+] Videos save to: {VIDEO_DIR}")
+    if TRANSCRIBE_ENABLED:
+        print(f"[+] Audio saves to: {AUDIO_DIR}")
+        model = whisper.load_model("base", device="cpu")
+    else:
+        model = None
 
     while True:
         with lock:
             url = data["url"]
 
-        if url and url != last_processed_url:
+        url_key = normalize_url_for_dedup(url)
+        if url and is_valid_video_url(url) and url_key and url_key != last_processed_key:
             print(f"[+] Processing new URL: {url}")
 
             try:
                 # Download new video into static/videos with a unique id
                 job_id = uuid.uuid4().hex
                 outtmpl = str(VIDEO_DIR / f"{job_id}.%(ext)s")
-                ydl_opts = {
-                    "outtmpl": outtmpl,
-                    # Best video + best audio, fallback to best single file
-                    "format": "bv*+ba/best",
 
-                    # Prefer ffmpeg for HLS (avoids flaky hlsnative)
-                    "hls_prefer_native": False,
+                has_ffmpeg = ffmpeg_bin is not None
 
-                    # Reliability
-                    "skip_unavailable_fragments": True,
-                    "fragment_retries": 20,
-                    "retries": 10,
-                    "concurrent_fragment_downloads": 8,
-                    "noplaylist": True,
-
-                    # Keep the merged MP4 even after extracting audio
-                    "keepvideo": True,
-
-                    # Postprocess/merge to MP4 (requires ffmpeg in PATH)
-                    "postprocessors": [
-                        {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-                        {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"},
-                    ],
-                    "merge_output_format": "mp4",
-
-                    # Help YouTube extraction
-                    "http_headers": {"User-Agent": "Mozilla/5.0"},
-                    "extractor_args": {"youtube": {"player_client": ["web", "ios", "android"]}},
-                }
+                if has_ffmpeg and TRANSCRIBE_ENABLED:
+                    ydl_opts = {
+                        "paths": {"home": str(VIDEO_DIR), "temp": str(VIDEO_DIR)},
+                        "outtmpl": outtmpl,
+                        "format": "bv*+ba/best",
+                        "hls_prefer_native": False,
+                        "skip_unavailable_fragments": True,
+                        "fragment_retries": 20,
+                        "retries": 10,
+                        "concurrent_fragment_downloads": 8,
+                        "noplaylist": True,
+                        "keepvideo": True,
+                        "postprocessors": [
+                            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+                            {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"},
+                        ],
+                        "merge_output_format": "mp4",
+                        "http_headers": {"User-Agent": "Mozilla/5.0"},
+                        "extractor_args": {"youtube": {"player_client": ["web", "ios", "android"]}},
+                    }
+                elif has_ffmpeg and not TRANSCRIBE_ENABLED:
+                    ydl_opts = {
+                        "paths": {"home": str(VIDEO_DIR), "temp": str(VIDEO_DIR)},
+                        "outtmpl": outtmpl,
+                        "format": "bv*+ba/best",
+                        "hls_prefer_native": False,
+                        "skip_unavailable_fragments": True,
+                        "fragment_retries": 20,
+                        "retries": 10,
+                        "concurrent_fragment_downloads": 8,
+                        "noplaylist": True,
+                        "postprocessors": [
+                            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+                        ],
+                        "merge_output_format": "mp4",
+                        "http_headers": {"User-Agent": "Mozilla/5.0"},
+                        "extractor_args": {"youtube": {"player_client": ["web", "ios", "android"]}},
+                    }
+                else:
+                    # No ffmpeg: use single-format only (no merge), no postprocessors
+                    # Instagram DASH may still fail - install ffmpeg for full support
+                    ydl_opts = {
+                        "paths": {"home": str(VIDEO_DIR), "temp": str(VIDEO_DIR)},
+                        "outtmpl": outtmpl,
+                        "format": "best[ext=mp4]/best",
+                        "hls_prefer_native": False,
+                        "skip_unavailable_fragments": True,
+                        "fragment_retries": 20,
+                        "retries": 10,
+                        "concurrent_fragment_downloads": 8,
+                        "noplaylist": True,
+                        "postprocessors": [],
+                        "http_headers": {"User-Agent": "Mozilla/5.0"},
+                        "extractor_args": {"youtube": {"player_client": ["web", "ios", "android"]}},
+                    }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
-                # Update global video_path to the saved mp4
+                # Find the downloaded file (may be .mp4, .webm, .m4a, etc.)
                 saved_mp4 = str(VIDEO_DIR / f"{job_id}.mp4")
                 saved_audio_m4a = str(VIDEO_DIR / f"{job_id}.m4a")
                 global video_path
                 if os.path.exists(saved_mp4):
                     video_path = saved_mp4
                 else:
-                    video_path = None
+                    # No ffmpeg path: look for any downloaded video
+                    candidates = list(VIDEO_DIR.glob(f"{job_id}.*"))
+                    video_path = str(candidates[0]) if candidates else None
+                if video_path:
+                    print(f"[+] Video saved: {video_path}")
 
-                # Transcribe downloaded media (prefer extracted m4a for speed)
-                source_for_transcription = saved_audio_m4a if os.path.exists(saved_audio_m4a) else saved_mp4
-                result = model.transcribe(source_for_transcription)
-                transcription = result["text"]
-                if not transcription or not transcription.strip():
-                    transcription = "..."
+                # Move audio to AUDIO_DIR when transcribing (videos stay in VIDEO_DIR)
+                if TRANSCRIBE_ENABLED and os.path.exists(saved_audio_m4a):
+                    dest_m4a = str(AUDIO_DIR / f"{job_id}.m4a")
+                    shutil.move(saved_audio_m4a, dest_m4a)
+                    saved_audio_m4a = dest_m4a
+                    print(f"[+] Audio saved: {dest_m4a}")
 
-                # Save transcription to a file in the same folder as this script
-                output_path = os.path.join(script_dir, "transcription.txt")
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(transcription)
-                print(f"[+] Transcription saved to: {output_path}")
+                if TRANSCRIBE_ENABLED and model:
+                    # Transcribe downloaded media (prefer extracted m4a for speed)
+                    source_for_transcription = saved_audio_m4a if os.path.exists(saved_audio_m4a) else video_path
+                    if not source_for_transcription or not os.path.exists(source_for_transcription):
+                        raise FileNotFoundError("No media file was downloaded")
+                    print(f"[+] Transcribing: {source_for_transcription}")
+                    result = model.transcribe(source_for_transcription, fp16=False)
+                    transcription = (result.get("text") or "").strip()
+                    if not transcription:
+                        transcription = "..."
 
-                # Update transcription to server
-                with lock:
-                    data["transcription"] = transcription
-                    print(f"[+] Transcription completed: {transcription[:30]}...")
+                    # Update transcription to server immediately (so shortcut gets it even if file write fails)
+                    with lock:
+                        data["transcription"] = transcription
+                    print(f"[+] Transcription completed: {transcription[:50]}{'...' if len(transcription) > 50 else ''}")
 
-                last_processed_url = url
+                    # Save transcription to a file in the same folder as this script
+                    output_path = os.path.join(script_dir, "transcription.txt")
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        f.write(transcription)
+                    print(f"[+] Transcription saved to: {output_path}")
+                else:
+                    with lock:
+                        data["transcription"] = "(transcription disabled)"
+
+                last_processed_key = url_key
 
             except Exception as e:
                 print(f"[-] Error occurred: {e}")
+                traceback.print_exc()
+                last_processed_key = url_key  # avoid endless retries on same URL
                 with lock:
                     if not data.get("transcription"):
                         data["transcription"] = "..."
@@ -230,6 +422,10 @@ def start_gui():
     root.mainloop()
 
 if __name__ == '__main__':
+    TRANSCRIBE_ENABLED = prompt_transcribe_choice()
+    globals()["TRANSCRIBE_ENABLED"] = TRANSCRIBE_ENABLED
+    print(f"  Mode: {'Transcribe' if TRANSCRIBE_ENABLED else 'Download only'}\n")
+
     # Start background worker
     thread = Thread(target=worker, daemon=True)
     thread.start()
