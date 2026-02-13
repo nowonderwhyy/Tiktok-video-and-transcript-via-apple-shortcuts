@@ -318,21 +318,47 @@ def worker():
                     except Exception:
                         pass
 
+                # Capture actual output path from yt-dlp (X/Twitter may use different naming)
+                downloaded_paths = []
+
+                def progress_hook(d):
+                    if d.get("status") == "finished":
+                        info = d.get("info_dict") or {}
+                        path = info.get("_filename")
+                        if path and os.path.isfile(path):
+                            ext = (Path(path).suffix or "").lower()
+                            if ext != ".m4a":  # exclude extracted audio only
+                                downloaded_paths.append(path)
+
+                ydl_opts["progress_hooks"] = [progress_hook]
+
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
-                # Find the downloaded file (may be .mp4, .webm, .m4a, etc.)
+                # Find the downloaded file: prefer yt-dlp's actual path, else our expected path
                 saved_mp4 = str(VIDEO_DIR / f"{job_id}.mp4")
                 saved_audio_m4a = str(VIDEO_DIR / f"{job_id}.m4a")
                 global video_path
-                if os.path.exists(saved_mp4):
+                video_path = None
+                if downloaded_paths:
+                    # Use actual path from yt-dlp (handles X/Twitter naming quirks)
+                    p = Path(downloaded_paths[-1]).resolve()
+                    try:
+                        p.relative_to(BASE_DIR)
+                        video_path = str(p)
+                    except ValueError:
+                        pass  # path outside BASE_DIR, use fallback
+                if not video_path and os.path.exists(saved_mp4):
                     video_path = saved_mp4
-                else:
-                    # No ffmpeg path: look for any downloaded video
+                if not video_path:
+                    # Fallback: look for any downloaded video with our job_id
                     candidates = list(VIDEO_DIR.glob(f"{job_id}.*"))
                     video_path = str(candidates[0]) if candidates else None
                 if video_path:
                     print(f"[+] Video saved: {video_path}")
+                    if not TRANSCRIBE_ENABLED:
+                        with lock:
+                            data["transcription"] = url
 
                 # Convert X GIFs from mp4 to actual .gif
                 if convert_to_gif and video_path and ffmpeg_bin:
@@ -376,9 +402,6 @@ def worker():
                     with open(output_path, "w", encoding="utf-8") as f:
                         f.write(transcription)
                     print(f"[+] Transcription saved to: {output_path}")
-                else:
-                    with lock:
-                        data["transcription"] = url
 
                 last_processed_key = url_key
 
