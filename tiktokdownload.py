@@ -10,7 +10,7 @@ import time
 import traceback
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 import uuid
 import webbrowser
 
@@ -199,6 +199,32 @@ def is_x_url(url):
     return "x.com" in host or "twitter.com" in host
 
 
+def normalize_x_url_for_ytdlp(url):
+    """Map x.com hosts to twitter.com for extractor compatibility."""
+    if not url or not isinstance(url, str):
+        return url
+    raw = url.strip()
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return raw
+    if host == "x.com":
+        normalized_host = "twitter.com"
+    elif host.endswith(".x.com"):
+        normalized_host = host[: -len(".x.com")] + ".twitter.com"
+    else:
+        return raw
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+    port = f":{parsed.port}" if parsed.port else ""
+    normalized_netloc = f"{userinfo}{normalized_host}{port}"
+    return urlunparse(parsed._replace(netloc=normalized_netloc))
+
+
 def convert_mp4_to_gif(ffmpeg_bin, input_path, output_path):
     """Convert video (mp4/webm) to gif using ffmpeg with palette for quality."""
     bin_dir = Path(ffmpeg_bin)
@@ -214,18 +240,48 @@ def convert_mp4_to_gif(ffmpeg_bin, input_path, output_path):
     return result.returncode == 0 and os.path.exists(output_path)
 
 
+def is_x_gif_from_info(info):
+    """Detect animated GIF tweets using X media URL markers from yt-dlp metadata."""
+    if not isinstance(info, dict):
+        return False
+
+    # If extractor returns a playlist wrapper, inspect entries.
+    if info.get("_type") == "playlist":
+        entries = info.get("entries") or []
+        return any(is_x_gif_from_info(entry) for entry in entries if isinstance(entry, dict))
+
+    thumbs = []
+    thumbnail = info.get("thumbnail")
+    if isinstance(thumbnail, str):
+        thumbs.append(thumbnail)
+    for t in info.get("thumbnails") or []:
+        if isinstance(t, dict) and isinstance(t.get("url"), str):
+            thumbs.append(t["url"])
+    if any("/tweet_video_thumb/" in u for u in thumbs):
+        return True
+
+    format_urls = []
+    for fmt in info.get("formats") or []:
+        if isinstance(fmt, dict) and isinstance(fmt.get("url"), str):
+            format_urls.append(fmt["url"])
+    direct_url = info.get("url")
+    if isinstance(direct_url, str):
+        format_urls.append(direct_url)
+
+    if any("/tweet_video/" in u for u in format_urls):
+        # Keep this strict: ext_tw_video/amplify_video are regular videos.
+        if not any("/ext_tw_video/" in u or "/amplify_video/" in u for u in format_urls):
+            return True
+    return False
+
+
 def is_likely_x_gif(ydl, url):
-    """Try to detect if X URL is a GIF (short looping video). Returns True if likely GIF."""
+    """Try to detect if X URL is an actual GIF using media markers, not duration."""
     try:
         info = ydl.extract_info(url, download=False)
         if not info:
             return False
-        # X GIFs: usually short (< 30 sec)
-        duration = info.get("duration")
-        if duration is not None:
-            return duration <= 30  # GIFs are typically 2–15 sec
-        # No duration: could be GIF, be conservative and try conversion for short files
-        return True
+        return is_x_gif_from_info(info)
     except Exception:
         return False
 
@@ -407,22 +463,20 @@ def worker():
                         "http_headers": {"User-Agent": "Mozilla/5.0"},
                         "extractor_args": {"youtube": {"player_client": ["web", "ios", "android"]}},
                     }
-                # For X URLs, check if it's a GIF before download (to convert to .gif after)
+                download_url = normalize_x_url_for_ytdlp(url) if is_x_url(url) else url
+
+                # For X URLs, detect GIFs strictly from yt-dlp metadata markers.
                 convert_to_gif = False
-                if is_x_url(url) and ffmpeg_bin:
-                    try:
-                        probe_opts = {"noplaylist": True, "quiet": True}
-                        with yt_dlp.YoutubeDL(probe_opts) as ydl:
-                            convert_to_gif = is_likely_x_gif(ydl, url)
-                    except Exception:
-                        pass
 
                 # Capture actual output path from yt-dlp (X/Twitter may use different naming)
                 downloaded_paths = []
+                download_meta = {"last_info": None}
 
                 def progress_hook(d):
                     if d.get("status") == "finished":
                         info = d.get("info_dict") or {}
+                        if is_x_url(url):
+                            download_meta["last_info"] = info
                         path = info.get("_filename")
                         if path and os.path.isfile(path):
                             ext = (Path(path).suffix or "").lower()
@@ -432,46 +486,64 @@ def worker():
                 ydl_opts["progress_hooks"] = [progress_hook]
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
+                    ydl.download([download_url])
+
+                if is_x_url(url) and ffmpeg_bin:
+                    info = download_meta.get("last_info")
+                    if isinstance(info, dict):
+                        convert_to_gif = is_x_gif_from_info(info)
+                    else:
+                        # Fallback to a metadata-only probe if hook info is unavailable.
+                        try:
+                            probe_opts = {"noplaylist": True, "quiet": True}
+                            with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                                convert_to_gif = is_likely_x_gif(ydl, download_url)
+                        except Exception:
+                            convert_to_gif = False
 
                 # Find the downloaded file: prefer yt-dlp's actual path, else our expected path
                 saved_mp4 = str(VIDEO_DIR / f"{job_id}.mp4")
                 saved_audio_m4a = str(VIDEO_DIR / f"{job_id}.m4a")
-                global video_path
-                video_path = None
+                downloaded_video = None
                 if downloaded_paths:
                     # Use actual path from yt-dlp (handles X/Twitter naming quirks)
                     p = Path(downloaded_paths[-1]).resolve()
                     try:
                         p.relative_to(BASE_DIR)
-                        video_path = str(p)
+                        downloaded_video = str(p)
                     except ValueError:
                         pass  # path outside BASE_DIR, use fallback
-                if not video_path and os.path.exists(saved_mp4):
-                    video_path = saved_mp4
-                if not video_path:
-                    # Fallback: look for any downloaded video with our job_id
-                    candidates = list(VIDEO_DIR.glob(f"{job_id}.*"))
-                    video_path = str(candidates[0]) if candidates else None
-                if video_path:
-                    print(f"[+] Video saved: {video_path}")
-                    if not TRANSCRIBE_ENABLED:
-                        with lock:
-                            data["transcription"] = url
+                if not downloaded_video and os.path.exists(saved_mp4):
+                    downloaded_video = saved_mp4
+                if not downloaded_video:
+                    # Fallback: look for any downloaded video with our job_id (exclude audio)
+                    candidates = [p for p in VIDEO_DIR.glob(f"{job_id}.*") if p.suffix.lower() != ".m4a"]
+                    downloaded_video = str(candidates[0]) if candidates else None
 
-                # Convert X GIFs from mp4 to actual .gif
-                if convert_to_gif and video_path and ffmpeg_bin:
-                    gif_path = str(VIDEO_DIR / f"{job_id}.gif")
-                    original_video = video_path
-                    if convert_mp4_to_gif(ffmpeg_bin, video_path, gif_path):
-                        video_path = gif_path
-                        try:
-                            os.remove(original_video)
-                            print(f"[+] Converted to GIF, removed original: {original_video}")
-                        except OSError as e:
-                            print(f"[+] Converted to GIF: {video_path} (could not remove original: {e})")
+                # Convert X GIFs from mp4 to actual .gif BEFORE exposing video_path
+                # (avoids race where Shortcut gets mp4 URL before conversion completes)
+                global video_path
+                video_path = None
+                if downloaded_video:
+                    if convert_to_gif and ffmpeg_bin:
+                        gif_path = str(VIDEO_DIR / f"{job_id}.gif")
+                        if convert_mp4_to_gif(ffmpeg_bin, downloaded_video, gif_path):
+                            video_path = gif_path
+                            try:
+                                os.remove(downloaded_video)
+                                print(f"[+] Converted to GIF, removed original: {downloaded_video}")
+                            except OSError as e:
+                                print(f"[+] Converted to GIF: {video_path} (could not remove original: {e})")
+                        else:
+                            video_path = downloaded_video
+                            print(f"[-] GIF conversion failed, keeping mp4")
                     else:
-                        print(f"[-] GIF conversion failed, keeping mp4")
+                        video_path = downloaded_video
+                    if video_path:
+                        print(f"[+] Video saved: {video_path}")
+                        if not TRANSCRIBE_ENABLED:
+                            with lock:
+                                data["transcription"] = url
 
                 # Move audio to AUDIO_DIR when transcribing (videos stay in VIDEO_DIR)
                 if TRANSCRIBE_ENABLED and os.path.exists(saved_audio_m4a):
