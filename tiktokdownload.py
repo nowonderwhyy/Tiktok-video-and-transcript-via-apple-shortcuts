@@ -382,29 +382,6 @@ def is_likely_x_gif(ydl, url):
         return False
 
 
-@app.route("/api/files/<which>")
-def list_files(which):
-    """List files in videos or audio directory."""
-    if which == "videos":
-        base = VIDEO_DIR
-        prefix = "/static/videos/"
-    elif which == "audio":
-        base = AUDIO_DIR
-        prefix = "/static/audio/"
-    else:
-        return jsonify({"error": "Invalid"}), 400
-    try:
-        files = []
-        for f in sorted(Path(base).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-            if f.is_file():
-                name = f.name
-                url = prefix + name
-                files.append({"name": name, "url": url})
-        return jsonify({"files": files})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 ASSETS_DIR = BASE_DIR / "assets"
 
 
@@ -412,14 +389,6 @@ ASSETS_DIR = BASE_DIR / "assets"
 def assets(filename):
     """Serve CSS/JS from assets folder."""
     return send_from_directory(ASSETS_DIR, filename)
-
-
-@app.route("/viewer/<which>")
-def viewer_page(which):
-    """Serve the file viewer page (videos or audio)."""
-    if which not in ("videos", "audio"):
-        return "Not found", 404
-    return render_template("viewer.html", folder=which)
 
 
 @app.route('/')
