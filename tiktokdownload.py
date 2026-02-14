@@ -418,18 +418,6 @@ def set_url():
         print(f"[+] URL received: {data['url']} (save locally: {'ON' if requested_save_mode else 'OFF'})")
     return jsonify({"status": "URL received"})
 
-@app.route('/paths', methods=['GET'])
-def get_paths():
-    """Return video and audio directory paths."""
-    with lock:
-        save_videos_locally = SAVE_VIDEOS_LOCALLY
-    return jsonify({
-        "videos": str(VIDEO_DIR),
-        "audio": str(AUDIO_DIR),
-        "save_videos_locally": save_videos_locally,
-    })
-
-
 @app.route('/get_transcription', methods=['GET'])
 def get_transcription():
     url = ""

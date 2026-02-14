@@ -174,41 +174,5 @@ copyBtn.onclick = () => {
   });
 };
 
-async function loadPaths() {
-  try {
-    const r = await fetch('/paths');
-    if (r.ok) {
-      const j = await r.json();
-      const vEl = document.getElementById('videosPath');
-      const aEl = document.getElementById('audioPath');
-
-      vEl.textContent = j.videos || '-';
-      vEl.title = j.videos || '';
-      aEl.textContent = j.audio || '-';
-      aEl.title = j.audio || '';
-
-      document.getElementById('copyVideos').onclick = () => copyPath(j.videos, 'copyVideos');
-      document.getElementById('copyAudio').onclick = () => copyPath(j.audio, 'copyAudio');
-    }
-  } catch (_) {
-    // Ignore transient path loading errors.
-  }
-}
-
-function copyPath(path, btnId) {
-  if (!path) return;
-
-  navigator.clipboard.writeText(path).then(() => {
-    const b = document.getElementById(btnId);
-    b.textContent = 'Copied!';
-    b.classList.add('copied');
-    setTimeout(() => {
-      b.textContent = 'Copy';
-      b.classList.remove('copied');
-    }, 2000);
-  });
-}
-
 renderRecent();
-loadPaths();
 poll();
