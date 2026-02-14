@@ -36,7 +36,6 @@ video_is_ephemeral = False
 
 # Set at startup by prompt_transcribe_choice()
 TRANSCRIBE_ENABLED = True
-HEADLESS = False
 SAVE_VIDEOS_LOCALLY = True
 
 _ORIGINAL_POPEN = subprocess.Popen
@@ -171,26 +170,15 @@ def prompt_transcribe_choice():
     return _prompt_choice("Transcribe videos?", opts) == 0
 
 
-def prompt_headless_choice():
-    """Ask whether to run headless (tray only). Returns True for headless."""
-    opts = ["Yes - run in background (tray icon only)", "No - show window"]
-    return _prompt_choice("Headless mode?", opts) == 0
-
-
 def _parse_cli_args():
-    """Parse --headless, --transcribe, --no-transcribe. Returns (transcribe, headless) or None."""
+    """Parse --transcribe, --no-transcribe. Returns transcribe bool or None."""
     transcribe = None
-    headless = None
     for i, a in enumerate(sys.argv[1:]):
         if a == "--transcribe":
             transcribe = True
         elif a == "--no-transcribe":
             transcribe = False
-        elif a == "--headless":
-            headless = True
-    if transcribe is not None and headless is not None:
-        return (transcribe, headless)
-    return None
+    return transcribe
 
 
 def _relaunch_headless_without_console(transcribe_enabled):
@@ -204,7 +192,7 @@ def _relaunch_headless_without_console(transcribe_enabled):
     if not pythonw.exists():
         return False
     script = Path(__file__).resolve()
-    args = [str(pythonw), str(script), "--headless", "--transcribe" if transcribe_enabled else "--no-transcribe"]
+    args = [str(pythonw), str(script), "--transcribe" if transcribe_enabled else "--no-transcribe"]
     try:
         subprocess.Popen(args, cwd=script.parent, creationflags=subprocess.CREATE_NO_WINDOW)
         return True
@@ -824,125 +812,31 @@ def start_tray():
     icon.run()
 
 
-def start_gui():
-    import tkinter as tk
-    from tkinter import ttk, messagebox
-    # Simple Tkinter UI to submit a URL and watch transcription status
-    root = tk.Tk()
-    root.title("TikTok Downloader & Transcriber")
-
-    url_var = tk.StringVar()
-    status_var = tk.StringVar(value="Idle")
-    last_text = {"value": ""}
-    last_video_url = {"value": ""}
-
-    container = ttk.Frame(root, padding=12)
-    container.pack(fill=tk.BOTH, expand=True)
-
-    ttk.Label(container, text="Paste video URL:").pack(anchor=tk.W)
-    entry = ttk.Entry(container, textvariable=url_var, width=70)
-    entry.pack(fill=tk.X)
-    entry.focus_set()
-
-    def submit_url():
-        url = url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Missing URL", "Please paste a video URL.")
-            return
-        try:
-            requests.post('http://127.0.0.1:5000/set_url', json={"url": url}, timeout=5)
-        except Exception:
-            # Fallback: set in-memory if local server not yet reachable
-            with lock:
-                data["url"] = url
-                data["transcription"] = ""
-                data["save_videos_locally"] = bool(SAVE_VIDEOS_LOCALLY)
-                _delete_runtime_video_if_any()
-        status_var.set("Submitted. Processing...")
-
-    ttk.Button(container, text="Submit", command=submit_url).pack(anchor=tk.W, pady=(6, 10))
-
-    ttk.Label(container, textvariable=status_var).pack(anchor=tk.W)
-    ttk.Label(container, text="Transcription:").pack(anchor=tk.W, pady=(10, 2))
-
-    transcript = tk.Text(container, height=10, wrap=tk.WORD)
-    transcript.pack(fill=tk.BOTH, expand=True)
-    transcript.configure(state=tk.DISABLED)
-
-    def set_transcript_text(text):
-        transcript.configure(state=tk.NORMAL)
-        transcript.delete("1.0", tk.END)
-        transcript.insert(tk.END, text)
-        transcript.configure(state=tk.DISABLED)
-
-    link_frame = ttk.Frame(container)
-    link_frame.pack(fill=tk.X, pady=(8, 0))
-    video_btn = ttk.Button(link_frame, text="Open Downloaded Video", state=tk.DISABLED)
-    video_btn.pack(anchor=tk.W)
-
-    def open_video():
-        if last_video_url["value"]:
-            try:
-                webbrowser.open(last_video_url["value"])  # open in default browser
-            except Exception:
-                pass
-
-    video_btn.configure(command=open_video)
-
-    def poll():
-        try:
-            resp = requests.get('http://127.0.0.1:5000/get_transcription', timeout=5)
-            if resp.ok:
-                payload = resp.json()
-                text = payload.get("transcription", "") or "..."
-                video_url = payload.get("video_url", "")
-                if text != last_text["value"]:
-                    last_text["value"] = text
-                    set_transcript_text(text)
-                    # Update status based on whether we're still waiting
-                    if text.strip() and text.strip() != "...":
-                        status_var.set("Completed")
-                    else:
-                        status_var.set("Processing...")
-                if video_url != last_video_url["value"]:
-                    last_video_url["value"] = video_url
-                    video_btn.configure(state=(tk.NORMAL if video_url else tk.DISABLED))
-        except Exception:
-            # Server might not be up yet
-            pass
-        finally:
-            root.after(3000, poll)
-
-    root.after(1000, poll)
-    root.mainloop()
-
 if __name__ == '__main__':
     settings = load_app_settings()
     persisted_save_mode = settings.get("save_videos_locally")
     if isinstance(persisted_save_mode, bool):
         SAVE_VIDEOS_LOCALLY = persisted_save_mode
 
-    cli = _parse_cli_args()
-    if cli is not None:
-        TRANSCRIBE_ENABLED, HEADLESS = cli
+    cli_transcribe = _parse_cli_args()
+    if cli_transcribe is not None:
+        TRANSCRIBE_ENABLED = cli_transcribe
     else:
         TRANSCRIBE_ENABLED = prompt_transcribe_choice()
-        HEADLESS = prompt_headless_choice()
         print(f"  Mode: {'Transcribe' if TRANSCRIBE_ENABLED else 'Download only'}\n")
-        print(f"  Mode: {'Headless (tray)' if HEADLESS else 'Window'}\n")
+        print("  Mode: Headless (tray)\n")
 
-        # If headless on Windows, re-launch with pythonw (no console) so CMD can close
-        if HEADLESS and _relaunch_headless_without_console(TRANSCRIBE_ENABLED):
-            sys.exit(0)
+    # Re-launch with pythonw on Windows (no console)
+    if _relaunch_headless_without_console(TRANSCRIBE_ENABLED):
+        sys.exit(0)
 
     globals()["TRANSCRIBE_ENABLED"] = TRANSCRIBE_ENABLED
-    globals()["HEADLESS"] = HEADLESS
     globals()["SAVE_VIDEOS_LOCALLY"] = SAVE_VIDEOS_LOCALLY
 
     with lock:
         data["save_videos_locally"] = bool(SAVE_VIDEOS_LOCALLY)
 
-    if HEADLESS and os.name == "nt":
+    if os.name == "nt":
         _enable_no_window_subprocesses()
 
     # Start Flask first so server accepts connections ASAP
@@ -953,7 +847,4 @@ if __name__ == '__main__':
     worker_thread = Thread(target=worker, daemon=True)
     worker_thread.start()
 
-    if HEADLESS:
-        start_tray()
-    else:
-        start_gui()
+    start_tray()
