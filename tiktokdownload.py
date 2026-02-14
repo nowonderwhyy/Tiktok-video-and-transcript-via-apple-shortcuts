@@ -31,6 +31,37 @@ video_path = None
 
 # Set at startup by prompt_transcribe_choice()
 TRANSCRIBE_ENABLED = True
+HEADLESS = False
+
+_ORIGINAL_POPEN = subprocess.Popen
+_NO_WINDOW_PATCHED = False
+
+
+def _enable_no_window_subprocesses():
+    """On Windows headless mode, prevent child console windows from flashing."""
+    global _NO_WINDOW_PATCHED
+    if _NO_WINDOW_PATCHED or os.name != "nt":
+        return
+
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    sw_hide = getattr(subprocess, "SW_HIDE", 0)
+
+    def _popen_hidden(*args, **kwargs):
+        flags = kwargs.get("creationflags", 0) or 0
+        kwargs["creationflags"] = flags | create_no_window
+
+        startupinfo = kwargs.get("startupinfo")
+        if startupinfo is None:
+            startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= startf_use_showwindow
+        startupinfo.wShowWindow = sw_hide
+        kwargs["startupinfo"] = startupinfo
+
+        return _ORIGINAL_POPEN(*args, **kwargs)
+
+    subprocess.Popen = _popen_hidden
+    _NO_WINDOW_PATCHED = True
 
 
 def _prompt_choice(title, options):
@@ -773,6 +804,10 @@ if __name__ == '__main__':
             sys.exit(0)
 
     globals()["TRANSCRIBE_ENABLED"] = TRANSCRIBE_ENABLED
+    globals()["HEADLESS"] = HEADLESS
+
+    if HEADLESS and os.name == "nt":
+        _enable_no_window_subprocesses()
 
     # Start Flask first so server accepts connections ASAP
     server_thread = Thread(target=start_flask, daemon=True)
