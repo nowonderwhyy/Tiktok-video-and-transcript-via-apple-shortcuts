@@ -1,11 +1,13 @@
-from flask import Flask, request, jsonify, send_from_directory, render_template
+from flask import Flask, request, jsonify, send_from_directory, render_template, send_file
 from threading import Thread, Lock
 import requests
 import yt_dlp
 from yt_dlp.postprocessor import FFmpegPostProcessor
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import shutil
@@ -17,21 +19,26 @@ import webbrowser
 # Server configuration
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24).hex())
-data = {"url": "", "transcription": ""}
+data = {"url": "", "transcription": "", "save_videos_locally": True}
 lock = Lock()
 script_dir = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR = (BASE_DIR / "static" / "videos").resolve()
 AUDIO_DIR = (BASE_DIR / "static" / "audio").resolve()
+SETTINGS_FILE = (BASE_DIR / "app_settings.json").resolve()
+RUNTIME_VIDEO_DIR = (Path(tempfile.gettempdir()) / "tiktok_downloader_runtime_videos").resolve()
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+RUNTIME_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 # Path to saved mp4 for current job
 video_path = None
+video_is_ephemeral = False
 
 # Set at startup by prompt_transcribe_choice()
 TRANSCRIBE_ENABLED = True
 HEADLESS = False
+SAVE_VIDEOS_LOCALLY = True
 
 _ORIGINAL_POPEN = subprocess.Popen
 _NO_WINDOW_PATCHED = False
@@ -62,6 +69,56 @@ def _enable_no_window_subprocesses():
 
     subprocess.Popen = _popen_hidden
     _NO_WINDOW_PATCHED = True
+
+
+def _is_path_inside(path, parent):
+    """Return True when path is inside parent."""
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _delete_runtime_video_if_any():
+    """Delete current ephemeral runtime video if present."""
+    global video_path, video_is_ephemeral
+    path = video_path
+    ephemeral = video_is_ephemeral
+    if path and ephemeral and _is_path_inside(path, RUNTIME_VIDEO_DIR):
+        try:
+            os.remove(path)
+            print(f"[+] Removed temporary video: {path}")
+        except OSError:
+            pass
+    video_path = None
+    video_is_ephemeral = False
+
+
+def load_app_settings():
+    """Load persisted app settings."""
+    settings = {}
+    try:
+        if SETTINGS_FILE.exists():
+            raw = SETTINGS_FILE.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                settings = parsed
+    except Exception as e:
+        print(f"[!] Failed to load settings from {SETTINGS_FILE}: {e}")
+    return settings
+
+
+def persist_save_videos_setting(enabled):
+    """Persist save-videos-locally preference."""
+    payload = {"save_videos_locally": bool(enabled)}
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception as e:
+        print(f"[!] Failed to persist settings to {SETTINGS_FILE}: {e}")
 
 
 def _prompt_choice(title, options):
@@ -372,40 +429,59 @@ def set_url():
         return jsonify({"status": "Invalid URL", "error": "Provide a valid TikTok, Instagram, or YouTube URL"}), 400
     new_key = normalize_url_for_dedup(new_url)
     with lock:
+        requested_save_mode = bool(SAVE_VIDEOS_LOCALLY)
         current_key = normalize_url_for_dedup(data.get("url", ""))
-        if new_key and new_key == current_key:
+        current_save_mode = bool(data.get("save_videos_locally", requested_save_mode))
+        if new_key and new_key == current_key and current_save_mode == requested_save_mode:
             return jsonify({"status": "URL already set"})
         data["url"] = new_url
         data["transcription"] = ""
-        global video_path
-        video_path = None
-        print(f"[+] URL received: {data['url']}")
+        data["save_videos_locally"] = requested_save_mode
+        _delete_runtime_video_if_any()
+        print(f"[+] URL received: {data['url']} (save locally: {'ON' if requested_save_mode else 'OFF'})")
     return jsonify({"status": "URL received"})
 
 @app.route('/paths', methods=['GET'])
 def get_paths():
     """Return video and audio directory paths."""
+    with lock:
+        save_videos_locally = SAVE_VIDEOS_LOCALLY
     return jsonify({
         "videos": str(VIDEO_DIR),
         "audio": str(AUDIO_DIR),
+        "save_videos_locally": save_videos_locally,
     })
 
 
 @app.route('/get_transcription', methods=['GET'])
 def get_transcription():
-    global video_path
     url = ""
     with lock:
         # Build video URL if file exists
         if video_path and os.path.exists(video_path):
             base = request.host_url[:-1] if request.host_url.endswith("/") else request.host_url
-            rel = video_path.replace(str(BASE_DIR) + os.sep, "").replace("\\", "/")
-            url = f"{base}/{rel}"
+            if _is_path_inside(video_path, VIDEO_DIR):
+                rel = Path(video_path).resolve().relative_to(BASE_DIR).as_posix()
+                url = f"{base}/{rel}"
+            else:
+                url = f"{base}/media/current"
 
         return jsonify({
             "transcription": data.get("transcription", ""),
             "video_url": url
         })
+
+
+@app.route("/media/current", methods=["GET"])
+def serve_current_media():
+    """Serve the current downloaded media (used for non-static runtime files)."""
+    with lock:
+        path = video_path
+
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "No media available"}), 404
+
+    return send_file(path, conditional=True)
 
 def worker():
     last_processed_key = ""
@@ -415,9 +491,11 @@ def worker():
     while True:
         with lock:
             url = data["url"]
+            requested_save_mode = bool(data.get("save_videos_locally", SAVE_VIDEOS_LOCALLY))
 
         url_key = normalize_url_for_dedup(url)
-        if url and is_valid_video_url(url) and url_key and url_key != last_processed_key:
+        request_key = f"{url_key}|save:{1 if requested_save_mode else 0}" if url_key else ""
+        if url and is_valid_video_url(url) and request_key and request_key != last_processed_key:
             # Lazy-init ffmpeg on first URL (speeds up startup)
             if ffmpeg_bin is None:
                 ffmpeg_bin = find_ffmpeg_bin()
@@ -427,21 +505,23 @@ def worker():
                 else:
                     print("[!] ffmpeg not found. Install it for full support (Instagram, postprocessing).")
                 print(f"[+] Videos save to: {VIDEO_DIR}")
+                print(f"[+] Runtime-only videos save to: {RUNTIME_VIDEO_DIR}")
                 if TRANSCRIBE_ENABLED:
                     print(f"[+] Audio saves to: {AUDIO_DIR}")
 
             print(f"[+] Processing new URL: {url}")
 
             try:
-                # Download new video into static/videos with a unique id
+                # Download new media with a unique id.
                 job_id = uuid.uuid4().hex
-                outtmpl = str(VIDEO_DIR / f"{job_id}.%(ext)s")
+                video_home_dir = VIDEO_DIR if requested_save_mode else RUNTIME_VIDEO_DIR
+                outtmpl = str(video_home_dir / f"{job_id}.%(ext)s")
 
                 has_ffmpeg = ffmpeg_bin is not None
 
                 if has_ffmpeg and TRANSCRIBE_ENABLED:
                     ydl_opts = {
-                        "paths": {"home": str(VIDEO_DIR), "temp": str(VIDEO_DIR)},
+                        "paths": {"home": str(video_home_dir), "temp": str(video_home_dir)},
                         "outtmpl": outtmpl,
                         "format": "bv*+ba/best",
                         "hls_prefer_native": False,
@@ -461,7 +541,7 @@ def worker():
                     }
                 elif has_ffmpeg and not TRANSCRIBE_ENABLED:
                     ydl_opts = {
-                        "paths": {"home": str(VIDEO_DIR), "temp": str(VIDEO_DIR)},
+                        "paths": {"home": str(video_home_dir), "temp": str(video_home_dir)},
                         "outtmpl": outtmpl,
                         "format": "bv*+ba/best",
                         "hls_prefer_native": False,
@@ -481,7 +561,7 @@ def worker():
                     # No ffmpeg: use single-format only (no merge), no postprocessors
                     # Instagram DASH may still fail - install ffmpeg for full support
                     ydl_opts = {
-                        "paths": {"home": str(VIDEO_DIR), "temp": str(VIDEO_DIR)},
+                        "paths": {"home": str(video_home_dir), "temp": str(video_home_dir)},
                         "outtmpl": outtmpl,
                         "format": "best[ext=mp4]/best",
                         "hls_prefer_native": False,
@@ -533,8 +613,8 @@ def worker():
                             convert_to_gif = False
 
                 # Find the downloaded file: prefer yt-dlp's actual path, else our expected path
-                saved_mp4 = str(VIDEO_DIR / f"{job_id}.mp4")
-                saved_audio_m4a = str(VIDEO_DIR / f"{job_id}.m4a")
+                saved_mp4 = str(video_home_dir / f"{job_id}.mp4")
+                saved_audio_m4a = str(video_home_dir / f"{job_id}.m4a")
                 downloaded_video = None
                 if downloaded_paths:
                     # Use actual path from yt-dlp (handles X/Twitter naming quirks)
@@ -548,16 +628,17 @@ def worker():
                     downloaded_video = saved_mp4
                 if not downloaded_video:
                     # Fallback: look for any downloaded video with our job_id (exclude audio)
-                    candidates = [p for p in VIDEO_DIR.glob(f"{job_id}.*") if p.suffix.lower() != ".m4a"]
+                    candidates = [p for p in video_home_dir.glob(f"{job_id}.*") if p.suffix.lower() != ".m4a"]
                     downloaded_video = str(candidates[0]) if candidates else None
 
                 # Convert X GIFs from mp4 to actual .gif BEFORE exposing video_path
                 # (avoids race where Shortcut gets mp4 URL before conversion completes)
-                global video_path
+                global video_path, video_is_ephemeral
                 video_path = None
+                video_is_ephemeral = False
                 if downloaded_video:
                     if convert_to_gif and ffmpeg_bin:
-                        gif_path = str(VIDEO_DIR / f"{job_id}.gif")
+                        gif_path = str(Path(downloaded_video).with_suffix(".gif"))
                         if convert_mp4_to_gif(ffmpeg_bin, downloaded_video, gif_path):
                             video_path = gif_path
                             try:
@@ -571,7 +652,10 @@ def worker():
                     else:
                         video_path = downloaded_video
                     if video_path:
+                        video_is_ephemeral = _is_path_inside(video_path, RUNTIME_VIDEO_DIR)
                         print(f"[+] Video saved: {video_path}")
+                        if video_is_ephemeral:
+                            print("[+] Video is temporary (not saved in static/videos).")
                         if not TRANSCRIBE_ENABLED:
                             with lock:
                                 data["transcription"] = url
@@ -610,12 +694,12 @@ def worker():
                         f.write(transcription)
                     print(f"[+] Transcription saved to: {output_path}")
 
-                last_processed_key = url_key
+                last_processed_key = request_key
 
             except Exception as e:
                 print(f"[-] Error occurred: {e}")
                 traceback.print_exc()
-                last_processed_key = url_key  # avoid endless retries on same URL
+                last_processed_key = request_key  # avoid endless retries on same request
                 with lock:
                     if not data.get("transcription"):
                         data["transcription"] = "..."
@@ -668,6 +752,28 @@ def start_tray():
     def open_browser(icon, item):
         webbrowser.open("http://127.0.0.1:5000")
 
+    def get_save_mode_text():
+        with lock:
+            enabled = SAVE_VIDEOS_LOCALLY
+        return "ON" if enabled else "OFF"
+
+    def toggle_save_videos(icon, item):
+        global SAVE_VIDEOS_LOCALLY
+        with lock:
+            SAVE_VIDEOS_LOCALLY = not SAVE_VIDEOS_LOCALLY
+            enabled = SAVE_VIDEOS_LOCALLY
+        persist_save_videos_setting(enabled)
+        print(f"[+] Save videos locally: {'ON' if enabled else 'OFF'}")
+        icon.title = f"TikTok Downloader - Ready at http://127.0.0.1:5000 | Save local: {get_save_mode_text()}"
+        try:
+            icon.update_menu()
+        except Exception:
+            pass
+
+    def is_save_videos_checked(item):
+        with lock:
+            return SAVE_VIDEOS_LOCALLY
+
     def quit_app(icon, item):
         icon.stop()
 
@@ -677,6 +783,7 @@ def start_tray():
         "TikTok Downloader - Starting...",
         menu=Menu(
             MenuItem("Open in browser", open_browser),
+            MenuItem("Save videos locally", toggle_save_videos, checked=is_save_videos_checked),
             MenuItem("Exit", quit_app),
         ),
     )
@@ -687,7 +794,7 @@ def start_tray():
                 r = requests.get("http://127.0.0.1:5000/get_transcription", timeout=1)
                 if r.ok:
                     icon.icon = make_icon_image(ready=True)
-                    icon.title = "TikTok Downloader - Ready at http://127.0.0.1:5000"
+                    icon.title = f"TikTok Downloader - Ready at http://127.0.0.1:5000 | Save local: {get_save_mode_text()}"
                     break
             except Exception:
                 pass
@@ -726,11 +833,11 @@ def start_gui():
             requests.post('http://127.0.0.1:5000/set_url', json={"url": url}, timeout=5)
         except Exception:
             # Fallback: set in-memory if local server not yet reachable
-            global video_path
             with lock:
                 data["url"] = url
                 data["transcription"] = ""
-                video_path = None
+                data["save_videos_locally"] = bool(SAVE_VIDEOS_LOCALLY)
+                _delete_runtime_video_if_any()
         status_var.set("Submitted. Processing...")
 
     ttk.Button(container, text="Submit", command=submit_url).pack(anchor=tk.W, pady=(6, 10))
@@ -790,6 +897,11 @@ def start_gui():
     root.mainloop()
 
 if __name__ == '__main__':
+    settings = load_app_settings()
+    persisted_save_mode = settings.get("save_videos_locally")
+    if isinstance(persisted_save_mode, bool):
+        SAVE_VIDEOS_LOCALLY = persisted_save_mode
+
     cli = _parse_cli_args()
     if cli is not None:
         TRANSCRIBE_ENABLED, HEADLESS = cli
@@ -805,6 +917,10 @@ if __name__ == '__main__':
 
     globals()["TRANSCRIBE_ENABLED"] = TRANSCRIBE_ENABLED
     globals()["HEADLESS"] = HEADLESS
+    globals()["SAVE_VIDEOS_LOCALLY"] = SAVE_VIDEOS_LOCALLY
+
+    with lock:
+        data["save_videos_locally"] = bool(SAVE_VIDEOS_LOCALLY)
 
     if HEADLESS and os.name == "nt":
         _enable_no_window_subprocesses()
