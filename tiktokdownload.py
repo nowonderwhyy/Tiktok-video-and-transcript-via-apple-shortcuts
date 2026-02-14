@@ -286,6 +286,15 @@ def is_x_url(url):
     return "x.com" in host or "twitter.com" in host
 
 
+def is_youtube_url(url):
+    """Check if URL is from YouTube."""
+    if not url:
+        return False
+    parsed = urlparse(url.strip().lower())
+    host = (parsed.netloc or "").split(":")[0]
+    return "youtube.com" in host or "youtu.be" in host
+
+
 def normalize_x_url_for_ytdlp(url):
     """Map x.com hosts to twitter.com for extractor compatibility."""
     if not url or not isinstance(url, str):
@@ -462,6 +471,9 @@ def get_transcription():
             if _is_path_inside(video_path, VIDEO_DIR):
                 rel = Path(video_path).resolve().relative_to(BASE_DIR).as_posix()
                 url = f"{base}/{rel}"
+            elif _is_path_inside(video_path, RUNTIME_VIDEO_DIR):
+                name = Path(video_path).name
+                url = f"{base}/runtime_videos/{name}"
             else:
                 url = f"{base}/media/current"
 
@@ -481,6 +493,12 @@ def serve_current_media():
         return jsonify({"error": "No media available"}), 404
 
     return send_file(path, conditional=True)
+
+
+@app.route("/runtime_videos/<path:filename>", methods=["GET"])
+def serve_runtime_video(filename):
+    """Serve runtime-only video files by actual filename."""
+    return send_from_directory(RUNTIME_VIDEO_DIR, filename, conditional=True)
 
 def worker():
     last_processed_key = ""
@@ -515,14 +533,29 @@ def worker():
                 job_id = uuid.uuid4().hex
                 video_home_dir = VIDEO_DIR if requested_save_mode else RUNTIME_VIDEO_DIR
                 outtmpl = str(video_home_dir / f"{job_id}.%(ext)s")
+                preexisting_files = {p.resolve() for p in video_home_dir.iterdir() if p.is_file()}
 
                 has_ffmpeg = ffmpeg_bin is not None
+                is_youtube = is_youtube_url(url)
+
+                # Prefer iPhone-friendly codecs for YouTube. Keep existing behavior for other platforms.
+                if is_youtube:
+                    ffmpeg_format_selector = (
+                        "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/"
+                        "b[vcodec^=avc1][ext=mp4]/"
+                        "bv*[ext=mp4]+ba[ext=m4a]/"
+                        "bv*+ba/best"
+                    )
+                    noffmpeg_format_selector = "best[vcodec^=avc1][ext=mp4]/best[ext=mp4]/best"
+                else:
+                    ffmpeg_format_selector = "bv*+ba/best"
+                    noffmpeg_format_selector = "best[ext=mp4]/best"
 
                 if has_ffmpeg and TRANSCRIBE_ENABLED:
                     ydl_opts = {
                         "paths": {"home": str(video_home_dir), "temp": str(video_home_dir)},
                         "outtmpl": outtmpl,
-                        "format": "bv*+ba/best",
+                        "format": ffmpeg_format_selector,
                         "hls_prefer_native": False,
                         "skip_unavailable_fragments": True,
                         "fragment_retries": 20,
@@ -542,7 +575,7 @@ def worker():
                     ydl_opts = {
                         "paths": {"home": str(video_home_dir), "temp": str(video_home_dir)},
                         "outtmpl": outtmpl,
-                        "format": "bv*+ba/best",
+                        "format": ffmpeg_format_selector,
                         "hls_prefer_native": False,
                         "skip_unavailable_fragments": True,
                         "fragment_retries": 20,
@@ -562,7 +595,7 @@ def worker():
                     ydl_opts = {
                         "paths": {"home": str(video_home_dir), "temp": str(video_home_dir)},
                         "outtmpl": outtmpl,
-                        "format": "best[ext=mp4]/best",
+                        "format": noffmpeg_format_selector,
                         "hls_prefer_native": False,
                         "skip_unavailable_fragments": True,
                         "fragment_retries": 20,
@@ -615,20 +648,51 @@ def worker():
                 saved_mp4 = str(video_home_dir / f"{job_id}.mp4")
                 saved_audio_m4a = str(video_home_dir / f"{job_id}.m4a")
                 downloaded_video = None
+
+                def is_candidate_media(path_obj):
+                    if not path_obj.exists() or not path_obj.is_file():
+                        return False
+                    ext = path_obj.suffix.lower()
+                    return ext not in (".m4a", ".part", ".tmp", ".ytdl")
+
+                def media_rank(path_obj):
+                    ext = path_obj.suffix.lower()
+                    if ext == ".mp4":
+                        return (0, -path_obj.stat().st_mtime)
+                    if ext == ".gif":
+                        return (1, -path_obj.stat().st_mtime)
+                    return (2, -path_obj.stat().st_mtime)
+
                 if downloaded_paths:
-                    # Use actual path from yt-dlp (handles X/Twitter naming quirks)
-                    p = Path(downloaded_paths[-1]).resolve()
-                    try:
-                        p.relative_to(BASE_DIR)
-                        downloaded_video = str(p)
-                    except ValueError:
-                        pass  # path outside BASE_DIR, use fallback
+                    # Prefer the most recent hook path that still exists.
+                    for raw_path in reversed(downloaded_paths):
+                        p = Path(raw_path).resolve()
+                        if not is_candidate_media(p):
+                            continue
+                        try:
+                            p.relative_to(BASE_DIR)
+                            downloaded_video = str(p)
+                            break
+                        except ValueError:
+                            continue  # path outside BASE_DIR, use fallback
+                # Progress hooks may point to a pre-conversion file (e.g. .webm) that got replaced.
+                if downloaded_video and not os.path.exists(downloaded_video):
+                    downloaded_video = None
                 if not downloaded_video and os.path.exists(saved_mp4):
                     downloaded_video = saved_mp4
                 if not downloaded_video:
-                    # Fallback: look for any downloaded video with our job_id (exclude audio)
-                    candidates = [p for p in video_home_dir.glob(f"{job_id}.*") if p.suffix.lower() != ".m4a"]
-                    downloaded_video = str(candidates[0]) if candidates else None
+                    # Fallback: look for files with expected job-id prefix.
+                    candidates = [p for p in video_home_dir.glob(f"{job_id}.*") if is_candidate_media(p)]
+                    if candidates:
+                        candidates.sort(key=media_rank)
+                        downloaded_video = str(candidates[0])
+                if not downloaded_video:
+                    # Final fallback: detect newly created files even if name doesn't match job_id.
+                    post_files = {p.resolve() for p in video_home_dir.iterdir() if p.is_file()}
+                    new_files = [p for p in (post_files - preexisting_files) if is_candidate_media(p)]
+                    if new_files:
+                        new_files.sort(key=media_rank)
+                        downloaded_video = str(new_files[0])
 
                 # Convert X GIFs from mp4 to actual .gif BEFORE exposing video_path
                 # (avoids race where Shortcut gets mp4 URL before conversion completes)
