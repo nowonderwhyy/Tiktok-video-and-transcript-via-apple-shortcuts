@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 import shutil
@@ -26,7 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR = (BASE_DIR / "static" / "videos").resolve()
 AUDIO_DIR = (BASE_DIR / "static" / "audio").resolve()
 SETTINGS_FILE = (BASE_DIR / "app_settings.json").resolve()
-RUNTIME_VIDEO_DIR = (Path(tempfile.gettempdir()) / "tiktok_downloader_runtime_videos").resolve()
+RUNTIME_VIDEO_DIR = (BASE_DIR / ".runtime" / "videos").resolve()
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 RUNTIME_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
