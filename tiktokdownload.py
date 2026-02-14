@@ -32,9 +32,8 @@ video_path = None
 TRANSCRIBE_ENABLED = True
 
 
-def prompt_transcribe_choice():
-    """Console menu: arrow keys + Enter to choose whether to transcribe videos."""
-    options = ["Yes - transcribe videos (videos in videos/, audio in audio/)", "No - download only (video in videos/)"]
+def _prompt_choice(title, options):
+    """Console menu: arrow keys + Enter. Returns index of selected option (0-based)."""
     selected = 0
 
     def clear_and_render():
@@ -42,7 +41,7 @@ def prompt_transcribe_choice():
             os.system("cls")
         else:
             os.system("clear")
-        print("\n  Transcribe videos?\n")
+        print(f"\n  {title}\n")
         for i, opt in enumerate(options):
             prefix = "  > " if i == selected else "    "
             print(f"{prefix} {opt}")
@@ -56,16 +55,15 @@ def prompt_transcribe_choice():
                 ch = msvcrt.getch()
                 if ch == b"\xe0":
                     ch2 = msvcrt.getch()
-                    if ch2 == b"H":  # Up
+                    if ch2 == b"H":
                         selected = (selected - 1) % len(options)
-                    elif ch2 == b"P":  # Down
+                    elif ch2 == b"P":
                         selected = (selected + 1) % len(options)
-                elif ch in (b"\r", b"\n"):  # Enter
-                    return selected == 0
+                elif ch in (b"\r", b"\n"):
+                    return selected
         except ImportError:
             pass
-    # Fallback: simple prompt
-    print("\n  Transcribe videos?")
+    print(f"\n  {title}")
     for i, opt in enumerate(options):
         print(f"  {i + 1}. {opt}")
     while True:
@@ -73,10 +71,57 @@ def prompt_transcribe_choice():
             choice = input("  Enter 1 or 2: ").strip()
             if choice in ("1", "2"):
                 print()
-                return choice == "1"
+                return int(choice) - 1
         except (EOFError, KeyboardInterrupt):
             print("\n")
-            return True
+            return 0
+
+
+def prompt_transcribe_choice():
+    """Ask whether to transcribe videos. Returns True for yes."""
+    opts = ["Yes - transcribe videos (videos in videos/, audio in audio/)", "No - download only (video in videos/)"]
+    return _prompt_choice("Transcribe videos?", opts) == 0
+
+
+def prompt_headless_choice():
+    """Ask whether to run headless (tray only). Returns True for headless."""
+    opts = ["Yes - run in background (tray icon only)", "No - show window"]
+    return _prompt_choice("Headless mode?", opts) == 0
+
+
+def _parse_cli_args():
+    """Parse --headless, --transcribe, --no-transcribe. Returns (transcribe, headless) or None."""
+    transcribe = None
+    headless = None
+    for i, a in enumerate(sys.argv[1:]):
+        if a == "--transcribe":
+            transcribe = True
+        elif a == "--no-transcribe":
+            transcribe = False
+        elif a == "--headless":
+            headless = True
+    if transcribe is not None and headless is not None:
+        return (transcribe, headless)
+    return None
+
+
+def _relaunch_headless_without_console(transcribe_enabled):
+    """On Windows, re-exec with pythonw.exe (no console) then exit. Returns True if we did."""
+    if sys.platform != "win32":
+        return False
+    exe = sys.executable.lower()
+    if "pythonw" in exe:
+        return False  # already no-console
+    pythonw = Path(sys.executable).parent / "pythonw.exe"
+    if not pythonw.exists():
+        return False
+    script = Path(__file__).resolve()
+    args = [str(pythonw), str(script), "--headless", "--transcribe" if transcribe_enabled else "--no-transcribe"]
+    try:
+        subprocess.Popen(args, cwd=script.parent, creationflags=subprocess.CREATE_NO_WINDOW)
+        return True
+    except Exception:
+        return False
 
 
 def normalize_url_for_dedup(url):
@@ -422,6 +467,77 @@ def start_flask():
     # Run Flask server in a background thread without the reloader
     app.run(host='0.0.0.0', port=5000, use_reloader=False)
 
+
+def _hide_console_window():
+    """Hide the CMD console window on Windows (headless mode)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+    except Exception:
+        pass
+
+
+def start_tray():
+    """Run system tray icon (headless mode). Blocks until user exits."""
+    try:
+        from pystray import Icon, Menu, MenuItem
+        from PIL import Image, ImageDraw
+    except ImportError:
+        print("[!] pystray not installed. Run: pip install pystray Pillow")
+        print("    Falling back to console (press Ctrl+C to exit)")
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            return
+
+    _hide_console_window()
+
+    def make_icon_image(ready=False):
+        w, h = 32, 32
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        fill = (76, 175, 80) if ready else (158, 158, 158)  # green when ready, gray when starting
+        d.rectangle([4, 6, 28, 26], fill=fill, outline=(255, 255, 255))
+        d.polygon([12, 14, 12, 18, 16, 16], fill=(255, 255, 255))
+        if ready:
+            d.ellipse([22, 22, 30, 30], fill=(255, 255, 255), outline=(76, 175, 80))
+        return img
+
+    def open_browser(icon, item):
+        webbrowser.open("http://127.0.0.1:5000")
+
+    def quit_app(icon, item):
+        icon.stop()
+
+    icon = Icon(
+        "TikTok Downloader",
+        make_icon_image(ready=False),
+        "TikTok Downloader - Starting...",
+        menu=Menu(
+            MenuItem("Open in browser", open_browser),
+            MenuItem("Exit", quit_app),
+        ),
+    )
+
+    def poll_server_ready():
+        for _ in range(60):  # poll up to ~30 seconds
+            try:
+                r = requests.get("http://127.0.0.1:5000/get_transcription", timeout=1)
+                if r.ok:
+                    icon.icon = make_icon_image(ready=True)
+                    icon.title = "TikTok Downloader - Ready at http://127.0.0.1:5000"
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    Thread(target=poll_server_ready, daemon=True).start()
+    icon.run()
+
+
 def start_gui():
     import tkinter as tk
     from tkinter import ttk, messagebox
@@ -515,9 +631,20 @@ def start_gui():
     root.mainloop()
 
 if __name__ == '__main__':
-    TRANSCRIBE_ENABLED = prompt_transcribe_choice()
+    cli = _parse_cli_args()
+    if cli is not None:
+        TRANSCRIBE_ENABLED, HEADLESS = cli
+    else:
+        TRANSCRIBE_ENABLED = prompt_transcribe_choice()
+        HEADLESS = prompt_headless_choice()
+        print(f"  Mode: {'Transcribe' if TRANSCRIBE_ENABLED else 'Download only'}\n")
+        print(f"  Mode: {'Headless (tray)' if HEADLESS else 'Window'}\n")
+
+        # If headless on Windows, re-launch with pythonw (no console) so CMD can close
+        if HEADLESS and _relaunch_headless_without_console(TRANSCRIBE_ENABLED):
+            sys.exit(0)
+
     globals()["TRANSCRIBE_ENABLED"] = TRANSCRIBE_ENABLED
-    print(f"  Mode: {'Transcribe' if TRANSCRIBE_ENABLED else 'Download only'}\n")
 
     # Start Flask first so server accepts connections ASAP
     server_thread = Thread(target=start_flask, daemon=True)
@@ -527,5 +654,7 @@ if __name__ == '__main__':
     worker_thread = Thread(target=worker, daemon=True)
     worker_thread.start()
 
-    # Start the desktop GUI for local input
-    start_gui()
+    if HEADLESS:
+        start_tray()
+    else:
+        start_gui()
