@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TikTok Downloader</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect fill='%23ff6a3d' width='32' height='32' rx='6'/><rect fill='%23009f9d' x='8' y='12' width='16' height='8' rx='2'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('assets', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero" aria-label="Downloader overview">
+      <p class="hero-kicker">Multi-platform download workspace</p>
+      <h1>Download videos, track progress, and grab transcripts fast.</h1>
+      <p class="hero-subtitle">Paste or drag a TikTok, Instagram, YouTube, or X link to start. The app keeps a recent URL history and direct folder shortcuts.</p>
+    </header>
+
+    <main class="layout-grid">
+      <section class="card downloader-card" aria-labelledby="downloader-title">
+        <h2 id="downloader-title" class="section-title">New Download</h2>
+
+        <div class="input-wrap" id="dropZone">
+          <input type="text" id="url" placeholder="Paste or drag URL here..." autocomplete="off" spellcheck="false" />
+          <button id="submit" type="button">Start</button>
+        </div>
+        <p class="drag-hint">Tip: You can drag a full URL directly into the field.</p>
+
+        <div class="status-row" aria-live="polite">
+          <div class="status-dots" aria-hidden="true">
+            <span class="status-dot" id="dot1" title="Download"></span>
+            <span class="status-dot" id="dot2" title="Transcribe"></span>
+            <span class="status-dot" id="dot3" title="Done"></span>
+          </div>
+          <span class="status-text" id="status">Idle</span>
+          <div id="spinner" class="spinner" style="display:none"></div>
+        </div>
+
+        <div class="transcription-header">
+          <span class="transcription-label">Transcript Output</span>
+          <button id="copyBtn" class="copy-btn btn-secondary" type="button" style="display:none">Copy</button>
+        </div>
+        <div id="transcription" class="transcription-box empty" aria-live="polite"></div>
+
+        <a id="videoLink" class="video-link" href="#" style="display:none">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          Open downloaded video
+        </a>
+      </section>
+
+      <aside class="side-stack" aria-label="Utility panels">
+        <section class="card paths-card" aria-labelledby="directories-title">
+          <h2 id="directories-title" class="section-title">Directories</h2>
+
+          <div class="path-row">
+            <span class="path-label">Videos</span>
+            <span id="videosPath" class="path-value" title="">-</span>
+            <div class="path-actions">
+              <button id="copyVideos" class="btn-secondary" type="button" title="Copy path">Copy</button>
+              <a href="/viewer/videos" target="_blank" rel="noopener">View</a>
+            </div>
+          </div>
+
+          <div class="path-row">
+            <span class="path-label">Audio</span>
+            <span id="audioPath" class="path-value" title="">-</span>
+            <div class="path-actions">
+              <button id="copyAudio" class="btn-secondary" type="button" title="Copy path">Copy</button>
+              <a href="/viewer/audio" target="_blank" rel="noopener">View</a>
+            </div>
+          </div>
+        </section>
+
+        <section class="card recent-section" aria-labelledby="recent-title">
+          <h2 id="recent-title" class="section-title">Recent URLs</h2>
+          <div id="recentList" class="recent-list"></div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="{{ url_for('assets', filename='js/app.js') }}"></script>
+</body>
+</html>

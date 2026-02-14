@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, render_template
 from threading import Thread, Lock
 import requests
 import yt_dlp
@@ -16,6 +16,7 @@ import webbrowser
 
 # Server configuration
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24).hex())
 data = {"url": "", "transcription": ""}
 lock = Lock()
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -229,6 +230,52 @@ def is_likely_x_gif(ydl, url):
         return False
 
 
+@app.route("/api/files/<which>")
+def list_files(which):
+    """List files in videos or audio directory."""
+    if which == "videos":
+        base = VIDEO_DIR
+        prefix = "/static/videos/"
+    elif which == "audio":
+        base = AUDIO_DIR
+        prefix = "/static/audio/"
+    else:
+        return jsonify({"error": "Invalid"}), 400
+    try:
+        files = []
+        for f in sorted(Path(base).iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f.is_file():
+                name = f.name
+                url = prefix + name
+                files.append({"name": name, "url": url})
+        return jsonify({"files": files})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+ASSETS_DIR = BASE_DIR / "assets"
+
+
+@app.route("/assets/<path:filename>")
+def assets(filename):
+    """Serve CSS/JS from assets folder."""
+    return send_from_directory(ASSETS_DIR, filename)
+
+
+@app.route("/viewer/<which>")
+def viewer_page(which):
+    """Serve the file viewer page (videos or audio)."""
+    if which not in ("videos", "audio"):
+        return "Not found", 404
+    return render_template("viewer.html", folder=which)
+
+
+@app.route('/')
+def index():
+    """Serve the web UI for headless mode."""
+    return render_template('index.html')
+
+
 @app.route('/set_url', methods=['POST'])
 def set_url():
     content = request.json or {}
@@ -247,6 +294,15 @@ def set_url():
         video_path = None
         print(f"[+] URL received: {data['url']}")
     return jsonify({"status": "URL received"})
+
+@app.route('/paths', methods=['GET'])
+def get_paths():
+    """Return video and audio directory paths."""
+    return jsonify({
+        "videos": str(VIDEO_DIR),
+        "audio": str(AUDIO_DIR),
+    })
+
 
 @app.route('/get_transcription', methods=['GET'])
 def get_transcription():
